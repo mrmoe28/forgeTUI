@@ -34,7 +34,7 @@ fn main() -> Result<()> {
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        bail!("ForgeTUI must be run from an interactive terminal. Try: cd /home/mrmoe28/coding-tui && cargo run --bin forge");
+        bail!("ForgeTUI must be run from an interactive terminal. Try: forge");
     }
 
     enable_raw_mode()?;

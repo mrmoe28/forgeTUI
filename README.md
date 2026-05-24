@@ -4,6 +4,39 @@ A unified terminal workspace for complicated coding work.
 
 Binary name: `forge`
 
+## Install
+
+Run this on a new machine:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mrmoe28/forgeTUI/main/scripts/install.sh | bash
+```
+
+Then start the TUI:
+
+```sh
+forge
+```
+
+The installer:
+
+- installs Rust/Cargo if missing
+- installs Ollama if missing
+- installs opencode if missing
+- clones or updates ForgeTUI
+- configures opencode for the Ollama OpenAI-compatible endpoint
+- registers known Ollama cloud coding models
+- builds ForgeTUI in release mode
+- installs `forge` into `~/.local/bin`
+
+If you plan to use Ollama Cloud models, sign in once:
+
+```sh
+ollama signin
+```
+
+Setup details are in [docs/setup-plan.md](docs/setup-plan.md).
+
 Planned capabilities:
 
 - Multiplexed terminal panes
