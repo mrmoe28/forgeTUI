@@ -1,5 +1,6 @@
 use std::{
     io::{self, BufRead, BufReader, IsTerminal, Stdout},
+    path::PathBuf,
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
@@ -20,6 +21,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
+
+const DEFAULT_MODEL: &str = "ollama/glm-4.7:cloud";
+const DEFAULT_AGENT_ROOT: &str = ".forge/agents";
 
 fn main() -> Result<()> {
     let mut terminal = init_terminal()?;
@@ -50,13 +54,18 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 struct App {
     input: String,
     model: String,
-    opencode_rx: Option<Receiver<BackendEvent>>,
+    models: Vec<String>,
+    next_job_id: usize,
     selected_task: usize,
     selected_agent: usize,
     show_sidebar: bool,
+    auto_test: bool,
     tasks: Vec<Task>,
     agents: Vec<Agent>,
+    jobs: Vec<BackendJob>,
     transcript: Vec<Message>,
+    history: Vec<SessionRecord>,
+    pending_review: Option<ReviewState>,
     status: String,
 }
 
@@ -64,25 +73,40 @@ impl Default for App {
     fn default() -> Self {
         Self {
             input: String::new(),
-            model: "ollama/glm-4.7:cloud".to_string(),
-            opencode_rx: None,
+            model: DEFAULT_MODEL.to_string(),
+            models: vec![
+                "ollama/glm-4.7:cloud".to_string(),
+                "ollama/qwen2.5-coder:32b".to_string(),
+                "ollama/qwen2.5-coder:7b".to_string(),
+                "ollama/hermes3:claude".to_string(),
+                "ollama/mistral-small:24b".to_string(),
+            ],
+            next_job_id: 1,
             selected_task: 0,
             selected_agent: 0,
             show_sidebar: true,
+            auto_test: true,
             tasks: vec![
                 Task::new("Build TUI shell", "ready", "cargo run"),
-                Task::new("Run tests", "queued", "cargo test"),
-                Task::new("Watch project", "queued", "watch -n 2 cargo check"),
+                Task::new("Run tests", "queued", "cargo check"),
+                Task::new("Show diff", "queued", "git diff --stat"),
             ],
-            agents: vec![
-                Agent::new("planner", "idle", "Break down implementation work"),
-                Agent::new("worker-1", "idle", "Implement scoped code changes"),
-                Agent::new("reviewer", "idle", "Review diffs before merge"),
-            ],
+            agents: vec![Agent::new(
+                "main",
+                "idle",
+                "Primary workspace agent",
+                PathBuf::from("."),
+                None,
+            )],
+            jobs: Vec::new(),
             transcript: vec![
                 Message::system("ForgeTUI started in agent workspace mode."),
-                Message::assistant("Type a request and press Enter to run opencode with ollama/glm-4.7:cloud. Use /agent, /run, /sidebar, or /help for local commands."),
+                Message::assistant(format!(
+                    "Normal prompts run opencode with {DEFAULT_MODEL}. Use /help for commands."
+                )),
             ],
+            history: Vec::new(),
+            pending_review: None,
             status: "ready".to_string(),
         }
     }
@@ -119,8 +143,8 @@ impl App {
             KeyEvent {
                 code: KeyCode::Enter,
                 ..
-            } => self.submit_input(),
-            KeyEvent {
+            }
+            | KeyEvent {
                 code: KeyCode::Char('\n' | '\r'),
                 ..
             } => self.submit_input(),
@@ -134,7 +158,7 @@ impl App {
                 code: KeyCode::Char('a'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            } => self.spawn_placeholder_agent(),
+            } => self.spawn_real_agent("Review the project and wait for a scoped task."),
             KeyEvent {
                 code: KeyCode::Char('r'),
                 modifiers: KeyModifiers::CONTROL,
@@ -145,6 +169,11 @@ impl App {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => self.toggle_sidebar(),
+            KeyEvent {
+                code: KeyCode::Char('x'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.cancel_latest_job(),
             KeyEvent {
                 code: KeyCode::Down,
                 ..
@@ -179,116 +208,231 @@ impl App {
         }
 
         self.transcript.push(Message::user(&submitted));
+        self.handle_command_or_prompt(&submitted);
+    }
 
-        match submitted.as_str() {
-            "/agent" => self.spawn_placeholder_agent(),
+    fn handle_command_or_prompt(&mut self, submitted: &str) {
+        let mut parts = submitted.splitn(2, ' ');
+        let command = parts.next().unwrap_or_default();
+        let rest = parts.next().unwrap_or_default().trim();
+
+        match command {
+            "/agent" => self.spawn_real_agent(if rest.is_empty() {
+                "Review the project and wait for a scoped task."
+            } else {
+                rest
+            }),
+            "/approve" => self.approve_review(),
+            "/cancel" => self.cancel_latest_job(),
+            "/diff" => self.show_pending_diff(),
+            "/history" => self.show_history(),
+            "/model" => self.set_or_show_model(rest),
+            "/models" => self.show_models(),
+            "/reject" => self.reject_review(),
             "/run" => self.run_selected_task(),
             "/sidebar" => self.toggle_sidebar(),
-            "/help" => self.transcript.push(Message::assistant(
-                "Commands: /agent spawns a placeholder agent, /run starts the selected task, /sidebar toggles the side panels. Normal prompts run opencode with the configured model.",
-            )),
-            _ => {
-                self.run_opencode(&submitted);
-            }
+            "/test" => self.run_tests_for_workspace(PathBuf::from(".")),
+            "/autotest" => self.toggle_auto_test(),
+            "/help" => self.show_help(),
+            _ => self.start_main_job(submitted),
         }
     }
 
-    fn run_opencode(&mut self, prompt: &str) {
-        if self.opencode_rx.is_some() {
+    fn show_help(&mut self) {
+        self.transcript.push(Message::assistant(
+            "Commands: /model [provider/model], /models, /agent <task>, /cancel, /diff, /approve, /reject, /test, /autotest, /history, /sidebar. Normal prompts run opencode in the main workspace.",
+        ));
+    }
+
+    fn start_main_job(&mut self, prompt: &str) {
+        if self.has_running_main_job() {
             self.transcript
-                .push(Message::system("opencode is already running"));
+                .push(Message::system("main opencode job is already running"));
             return;
         }
 
-        self.status = format!("running {}", self.model);
+        let before = WorkspaceSnapshot::capture(PathBuf::from("."));
+        self.start_opencode_job("main", prompt, PathBuf::from("."), before, None);
+    }
+
+    fn start_opencode_job(
+        &mut self,
+        label: &str,
+        prompt: &str,
+        workspace: PathBuf,
+        before: WorkspaceSnapshot,
+        agent_index: Option<usize>,
+    ) {
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        let model = self.model.clone();
+        let label = label.to_string();
+        let prompt = prompt.to_string();
+        let (tx, rx) = mpsc::channel();
+
+        self.status = format!("running job #{id}");
         self.transcript.push(Message::system(format!(
-            "Running `opencode run -m {} ...`",
-            self.model
+            "job #{id}: opencode run -m {model} in {}",
+            workspace.display()
         )));
 
-        let (tx, rx) = mpsc::channel();
-        let model = self.model.clone();
-        let prompt = prompt.to_string();
-
-        thread::spawn(move || {
-            let mut child = match Command::new("opencode")
-                .args(["run", "-m", model.as_str(), prompt.as_str()])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(err) => {
-                    let _ = tx.send(BackendEvent::Error(format!(
-                        "failed to start opencode: {err}"
-                    )));
-                    let _ = tx.send(BackendEvent::Done);
-                    return;
-                }
-            };
-
-            if let Some(stdout) = child.stdout.take() {
-                let tx = tx.clone();
-                thread::spawn(move || stream_reader(stdout, StreamKind::Stdout, tx));
-            }
-
-            if let Some(stderr) = child.stderr.take() {
-                let tx = tx.clone();
-                thread::spawn(move || stream_reader(stderr, StreamKind::Stderr, tx));
-            }
-
-            match child.wait() {
-                Ok(status) if status.success() => {}
-                Ok(status) => {
-                    let _ = tx.send(BackendEvent::Error(format!(
-                        "opencode exited with status {status}"
-                    )));
-                }
-                Err(err) => {
-                    let _ = tx.send(BackendEvent::Error(format!(
-                        "failed waiting for opencode: {err}"
-                    )));
-                }
-            }
-
-            let _ = tx.send(BackendEvent::Done);
+        thread::spawn({
+            let model = model.clone();
+            let prompt = prompt.clone();
+            let workspace = workspace.clone();
+            move || run_opencode_worker(model, prompt, workspace, tx)
         });
 
-        self.opencode_rx = Some(rx);
+        self.jobs.push(BackendJob {
+            id,
+            label,
+            prompt,
+            model,
+            workspace,
+            before,
+            rx,
+            pid: None,
+            running: true,
+            status: "running".to_string(),
+            output: String::new(),
+            agent_index,
+            kind: JobKind::Opencode,
+        });
     }
 
     fn drain_backend_events(&mut self) {
-        let Some(rx) = self.opencode_rx.take() else {
-            return;
-        };
+        let mut idx = 0;
+        while idx < self.jobs.len() {
+            let mut still_running = self.jobs[idx].running;
 
-        let mut still_running = true;
+            loop {
+                match self.jobs[idx].rx.try_recv() {
+                    Ok(BackendEvent::Started(pid)) => {
+                        self.jobs[idx].pid = Some(pid);
+                    }
+                    Ok(BackendEvent::Stdout(line)) => {
+                        if !self.jobs[idx].output.is_empty() {
+                            self.jobs[idx].output.push('\n');
+                        }
+                        self.jobs[idx].output.push_str(&line);
+                        self.push_streamed_assistant_line(format!(
+                            "[job #{}] {line}",
+                            self.jobs[idx].id
+                        ));
+                    }
+                    Ok(BackendEvent::Stderr(line)) => {
+                        self.transcript.push(Message::system(format!(
+                            "job #{}: {line}",
+                            self.jobs[idx].id
+                        )));
+                    }
+                    Ok(BackendEvent::Error(message)) => {
+                        self.transcript.push(Message::system(format!(
+                            "job #{}: {message}",
+                            self.jobs[idx].id
+                        )));
+                    }
+                    Ok(BackendEvent::Done(success)) => {
+                        self.finish_job(idx, success);
+                        still_running = false;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.finish_job(idx, false);
+                        still_running = false;
+                        break;
+                    }
+                }
+            }
 
-        loop {
-            match rx.try_recv() {
-                Ok(BackendEvent::Stdout(line)) => self.push_streamed_assistant_line(line),
-                Ok(BackendEvent::Stderr(line)) => {
-                    self.transcript
-                        .push(Message::system(format!("opencode: {line}")));
-                }
-                Ok(BackendEvent::Error(message)) => {
-                    self.transcript.push(Message::system(message));
-                }
-                Ok(BackendEvent::Done) => {
-                    self.status = "ready".to_string();
-                    still_running = false;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.status = "ready".to_string();
-                    still_running = false;
-                    break;
-                }
+            if still_running {
+                idx += 1;
+            } else {
+                idx += 1;
             }
         }
 
-        if still_running {
-            self.opencode_rx = Some(rx);
+        if self.jobs.iter().any(|job| job.running) {
+            let count = self.jobs.iter().filter(|job| job.running).count();
+            self.status = format!("{count} job(s) running");
+        } else if self.status.contains("running") {
+            self.status = "ready".to_string();
+        }
+    }
+
+    fn finish_job(&mut self, idx: usize, success: bool) {
+        if !self.jobs[idx].running {
+            return;
+        }
+
+        self.jobs[idx].running = false;
+        self.jobs[idx].status = if success { "done" } else { "failed" }.to_string();
+        let before = self.jobs[idx].before.clone();
+        let after = WorkspaceSnapshot::capture(self.jobs[idx].workspace.clone());
+        let changed = !after.status.trim().is_empty() || !after.diff_stat.trim().is_empty();
+
+        self.transcript.push(Message::system(format!(
+            "job #{} finished: {}",
+            self.jobs[idx].id, self.jobs[idx].status
+        )));
+
+        self.show_snapshot_summary(&before, &after);
+
+        if let Some(agent_index) = self.jobs[idx].agent_index {
+            if let Some(agent) = self.agents.get_mut(agent_index) {
+                agent.status = self.jobs[idx].status.clone();
+            }
+        } else if changed {
+            self.pending_review = Some(ReviewState {
+                job_id: self.jobs[idx].id,
+                workspace: self.jobs[idx].workspace.clone(),
+                before_clean: self.jobs[idx].before.is_clean(),
+                before_status: self.jobs[idx].before.status.clone(),
+                after_status: after.status.clone(),
+                diff_stat: after.diff_stat.clone(),
+                diff: after.diff.clone(),
+                accepted: false,
+            });
+
+            self.transcript.push(Message::system(
+                "changes are pending review: use /diff, /approve, or /reject",
+            ));
+
+            if self.auto_test {
+                self.run_tests_for_workspace(self.jobs[idx].workspace.clone());
+            }
+        }
+
+        self.history.push(SessionRecord {
+            job_id: self.jobs[idx].id,
+            label: self.jobs[idx].label.clone(),
+            model: self.jobs[idx].model.clone(),
+            workspace: self.jobs[idx].workspace.display().to_string(),
+            prompt: self.jobs[idx].prompt.clone(),
+            status: self.jobs[idx].status.clone(),
+            changed,
+        });
+    }
+
+    fn show_snapshot_summary(&mut self, before: &WorkspaceSnapshot, after: &WorkspaceSnapshot) {
+        let before_status = if before.status.trim().is_empty() {
+            "clean".to_string()
+        } else {
+            before.status.clone()
+        };
+        let after_status = if after.status.trim().is_empty() {
+            "clean".to_string()
+        } else {
+            after.status.clone()
+        };
+
+        self.transcript.push(Message::system(format!(
+            "before status:\n{before_status}\nafter status:\n{after_status}"
+        )));
+
+        if !after.diff_stat.trim().is_empty() {
+            self.transcript
+                .push(Message::system(format!("diff stat:\n{}", after.diff_stat)));
         }
     }
 
@@ -307,26 +451,257 @@ impl App {
         }
     }
 
-    fn spawn_placeholder_agent(&mut self) {
-        let name = format!("agent-{}", self.agents.len() + 1);
-        self.agents
-            .push(Agent::new(&name, "spawned", "Awaiting scoped coding task"));
-        self.selected_agent = self.agents.len() - 1;
-        self.status = format!("spawned {name}");
+    fn spawn_real_agent(&mut self, task: &str) {
+        let agent_number = self.agents.len();
+        let name = format!("agent-{agent_number}");
+        let workspace = PathBuf::from(DEFAULT_AGENT_ROOT).join(&name);
+        let branch = format!("forge/{name}");
+
+        match create_worktree(&workspace, &branch) {
+            Ok(()) => {
+                let agent_index = self.agents.len();
+                self.agents.push(Agent::new(
+                    &name,
+                    "running",
+                    task,
+                    workspace.clone(),
+                    Some(0),
+                ));
+                self.selected_agent = agent_index;
+                self.status = format!("spawned {name}");
+                self.transcript.push(Message::system(format!(
+                    "spawned {name} in {}",
+                    workspace.display()
+                )));
+
+                let before = WorkspaceSnapshot::capture(workspace.clone());
+                self.start_opencode_job(&name, task, workspace, before, Some(agent_index));
+                let job_id = self.next_job_id.saturating_sub(1);
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    agent.job_id = Some(job_id);
+                }
+            }
+            Err(err) => {
+                self.transcript.push(Message::system(format!(
+                    "failed to create agent worktree: {err}"
+                )));
+            }
+        }
+    }
+
+    fn cancel_latest_job(&mut self) {
+        let Some(job) = self.jobs.iter_mut().rev().find(|job| job.running) else {
+            self.transcript
+                .push(Message::system("no running job to cancel"));
+            return;
+        };
+
+        let Some(pid) = job.pid else {
+            self.transcript.push(Message::system(format!(
+                "job #{} has no process id yet",
+                job.id
+            )));
+            return;
+        };
+
+        let result = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+        match result {
+            Ok(status) if status.success() => {
+                job.status = "cancelled".to_string();
+                self.status = format!("cancelled job #{}", job.id);
+                self.transcript
+                    .push(Message::system(format!("sent cancel to job #{}", job.id)));
+            }
+            Ok(status) => self.transcript.push(Message::system(format!(
+                "kill failed for job #{} with status {status}",
+                job.id
+            ))),
+            Err(err) => self.transcript.push(Message::system(format!(
+                "failed to cancel job #{}: {err}",
+                job.id
+            ))),
+        }
+    }
+
+    fn approve_review(&mut self) {
+        let Some(review) = self.pending_review.as_mut() else {
+            self.transcript
+                .push(Message::system("no pending review to approve"));
+            return;
+        };
+
+        review.accepted = true;
         self.transcript.push(Message::system(format!(
-            "Spawned placeholder subagent `{name}`."
+            "approved changes from job #{}",
+            review.job_id
         )));
+    }
+
+    fn reject_review(&mut self) {
+        let Some(review) = self.pending_review.take() else {
+            self.transcript
+                .push(Message::system("no pending review to reject"));
+            return;
+        };
+
+        if !review.before_clean {
+            self.transcript.push(Message::system(format!(
+                "reject refused because the workspace was not clean before the run:\n{}",
+                review.before_status
+            )));
+            self.pending_review = Some(review);
+            return;
+        }
+
+        let status = Command::new("git")
+            .args(["restore", "--worktree", "--staged", "."])
+            .current_dir(&review.workspace)
+            .status();
+
+        match status {
+            Ok(status) if status.success() => self.transcript.push(Message::system(format!(
+                "rejected changes from job #{}",
+                review.job_id
+            ))),
+            Ok(status) => {
+                self.transcript
+                    .push(Message::system(format!("git restore failed with {status}")));
+                self.pending_review = Some(review);
+            }
+            Err(err) => {
+                self.transcript
+                    .push(Message::system(format!("failed to run git restore: {err}")));
+                self.pending_review = Some(review);
+            }
+        }
+    }
+
+    fn show_pending_diff(&mut self) {
+        let Some(review) = &self.pending_review else {
+            self.transcript.push(Message::system("no pending diff"));
+            return;
+        };
+
+        let diff = if review.diff.trim().is_empty() {
+            "(no diff)".to_string()
+        } else {
+            truncate_chars(&review.diff, 6000)
+        };
+        self.transcript.push(Message::system(format!(
+            "job #{} diff:\n{}\n\nstatus:\n{}\n\nstat:\n{}",
+            review.job_id, diff, review.after_status, review.diff_stat
+        )));
+    }
+
+    fn set_or_show_model(&mut self, rest: &str) {
+        if rest.is_empty() {
+            self.transcript
+                .push(Message::system(format!("current model: {}", self.model)));
+            return;
+        }
+
+        self.model = rest.to_string();
+        self.status = format!("model {}", self.model);
+        self.transcript
+            .push(Message::system(format!("model set to {}", self.model)));
+    }
+
+    fn show_models(&mut self) {
+        self.transcript.push(Message::system(format!(
+            "known models:\n{}",
+            self.models.join("\n")
+        )));
+    }
+
+    fn show_history(&mut self) {
+        if self.history.is_empty() {
+            self.transcript
+                .push(Message::system("no session history yet"));
+            return;
+        }
+
+        let lines = self
+            .history
+            .iter()
+            .rev()
+            .take(12)
+            .map(|record| {
+                format!(
+                    "#{} {} {} changed={} model={} workspace={} prompt={}",
+                    record.job_id,
+                    record.label,
+                    record.status,
+                    record.changed,
+                    record.model,
+                    record.workspace,
+                    truncate_chars(&record.prompt, 80)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.transcript
+            .push(Message::system(format!("history:\n{lines}")));
     }
 
     fn run_selected_task(&mut self) {
         if let Some(task) = self.tasks.get_mut(self.selected_task) {
             task.status = "started".to_string();
-            self.status = format!("started {}", task.name);
-            self.transcript.push(Message::system(format!(
-                "Task `{}` would run: {}",
-                task.name, task.command
-            )));
+            let command = task.command.clone();
+            let name = task.name.clone();
+            self.status = format!("started {name}");
+            self.transcript
+                .push(Message::system(format!("running task `{name}`: {command}")));
+            self.run_shell_job(&format!("task:{name}"), &command, PathBuf::from("."));
         }
+    }
+
+    fn run_tests_for_workspace(&mut self, workspace: PathBuf) {
+        self.run_shell_job("auto-test", "cargo check", workspace);
+    }
+
+    fn run_shell_job(&mut self, label: &str, command: &str, workspace: PathBuf) {
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        let (tx, rx) = mpsc::channel();
+        let command = command.to_string();
+        let before = WorkspaceSnapshot::capture(workspace.clone());
+
+        thread::spawn({
+            let command = command.clone();
+            let workspace = workspace.clone();
+            move || run_shell_worker(command, workspace, tx)
+        });
+
+        self.jobs.push(BackendJob {
+            id,
+            label: label.to_string(),
+            prompt: command,
+            model: "shell".to_string(),
+            workspace,
+            before,
+            rx,
+            pid: None,
+            running: true,
+            status: "running".to_string(),
+            output: String::new(),
+            agent_index: None,
+            kind: JobKind::Shell,
+        });
+    }
+
+    fn toggle_auto_test(&mut self) {
+        self.auto_test = !self.auto_test;
+        self.transcript.push(Message::system(format!(
+            "auto-test {}",
+            if self.auto_test {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )));
     }
 
     fn toggle_sidebar(&mut self) {
@@ -336,6 +711,12 @@ impl App {
         } else {
             "sidebar hidden".to_string()
         };
+    }
+
+    fn has_running_main_job(&self) -> bool {
+        self.jobs.iter().any(|job| {
+            job.running && job.workspace == PathBuf::from(".") && job.kind == JobKind::Opencode
+        })
     }
 
     fn render(&self, frame: &mut Frame) {
@@ -356,6 +737,7 @@ impl App {
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
+        let running = self.jobs.iter().filter(|job| job.running).count();
         let header = Line::from(vec![
             Span::styled(
                 "ForgeTUI",
@@ -367,6 +749,11 @@ impl App {
             Span::styled("agent workspace", Style::default().fg(Color::Gray)),
             Span::raw("  "),
             Span::styled(&self.status, Style::default().fg(Color::Green)),
+            Span::raw("  "),
+            Span::styled(
+                format!("jobs:{running}"),
+                Style::default().fg(Color::Yellow),
+            ),
         ]);
         frame.render_widget(Paragraph::new(header), area);
     }
@@ -415,8 +802,9 @@ impl App {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(6),
                 Constraint::Length(7),
+                Constraint::Length(7),
+                Constraint::Length(9),
                 Constraint::Min(0),
             ])
             .split(area);
@@ -424,14 +812,24 @@ impl App {
         self.render_project(frame, rows[0]);
         self.render_tasks(frame, rows[1]);
         self.render_agents(frame, rows[2]);
+        self.render_jobs(frame, rows[3]);
     }
 
     fn render_project(&self, frame: &mut Frame, area: Rect) {
+        let review = self
+            .pending_review
+            .as_ref()
+            .map(|review| format!("review  job #{}", review.job_id))
+            .unwrap_or_else(|| "review  none".to_string());
         let lines = vec![
-            Line::from("project  forge-tui"),
-            Line::from("binary   forge"),
-            Line::from("mode     local"),
+            Line::from("project forge-tui"),
+            Line::from("binary  forge"),
             Line::from(format!("model   {}", self.model)),
+            Line::from(format!(
+                "tests   {}",
+                if self.auto_test { "auto" } else { "manual" }
+            )),
+            Line::from(review),
         ];
         frame.render_widget(Paragraph::new(lines).block(panel("workspace")), area);
     }
@@ -470,7 +868,10 @@ impl App {
                 ]),
                 Line::from(vec![
                     Span::raw("    "),
-                    Span::styled(&agent.purpose, Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{} ({})", agent.workspace.display(), agent.purpose),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]),
             ])
         });
@@ -478,10 +879,23 @@ impl App {
         frame.render_widget(List::new(items).block(panel("agents")), area);
     }
 
+    fn render_jobs(&self, frame: &mut Frame, area: Rect) {
+        let items = self.jobs.iter().rev().take(8).map(|job| {
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("#{} ", job.id), Style::default().fg(Color::Cyan)),
+                Span::raw(&job.label),
+                Span::raw(" "),
+                Span::styled(&job.status, Style::default().fg(Color::Yellow)),
+            ]))
+        });
+
+        frame.render_widget(List::new(items).block(panel("jobs")), area);
+    }
+
     fn render_composer(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
         let prompt = if self.input.is_empty() {
-            "Ask ForgeTUI to change code, run a task, or spawn an agent..."
+            "Ask ForgeTUI to change code, run /agent task, /diff, /approve, /reject..."
         } else {
             self.input.as_str()
         };
@@ -509,8 +923,7 @@ impl App {
     }
 
     fn render_keys(&self, frame: &mut Frame, area: Rect) {
-        let help =
-            "Enter send | /agent spawn | /run task | /sidebar toggle | Ctrl-B sidebar | Esc quit";
+        let help = "Enter send | /model | /agent | /cancel | /diff | /approve | /reject | /history | Esc quit";
         frame.render_widget(Paragraph::new(help), area);
     }
 }
@@ -566,16 +979,81 @@ enum Role {
     Assistant,
 }
 
+#[derive(PartialEq, Eq)]
+enum JobKind {
+    Opencode,
+    Shell,
+}
+
+struct BackendJob {
+    id: usize,
+    label: String,
+    prompt: String,
+    model: String,
+    workspace: PathBuf,
+    before: WorkspaceSnapshot,
+    rx: Receiver<BackendEvent>,
+    pid: Option<u32>,
+    running: bool,
+    status: String,
+    output: String,
+    agent_index: Option<usize>,
+    kind: JobKind,
+}
+
 enum BackendEvent {
+    Started(u32),
     Stdout(String),
     Stderr(String),
     Error(String),
-    Done,
+    Done(bool),
 }
 
 enum StreamKind {
     Stdout,
     Stderr,
+}
+
+#[derive(Clone)]
+struct WorkspaceSnapshot {
+    status: String,
+    diff_stat: String,
+    diff: String,
+}
+
+impl WorkspaceSnapshot {
+    fn capture(workspace: PathBuf) -> Self {
+        Self {
+            status: run_git_capture(&workspace, &["status", "--short"]),
+            diff_stat: run_git_capture(&workspace, &["diff", "--stat"]),
+            diff: run_git_capture(&workspace, &["diff"]),
+        }
+    }
+
+    fn is_clean(&self) -> bool {
+        self.status.trim().is_empty() && self.diff.trim().is_empty()
+    }
+}
+
+struct ReviewState {
+    job_id: usize,
+    workspace: PathBuf,
+    before_clean: bool,
+    before_status: String,
+    after_status: String,
+    diff_stat: String,
+    diff: String,
+    accepted: bool,
+}
+
+struct SessionRecord {
+    job_id: usize,
+    label: String,
+    model: String,
+    workspace: String,
+    prompt: String,
+    status: String,
+    changed: bool,
 }
 
 struct Task {
@@ -598,15 +1076,141 @@ struct Agent {
     name: String,
     status: String,
     purpose: String,
+    workspace: PathBuf,
+    job_id: Option<usize>,
 }
 
 impl Agent {
-    fn new(name: &str, status: &str, purpose: &str) -> Self {
+    fn new(
+        name: &str,
+        status: &str,
+        purpose: &str,
+        workspace: PathBuf,
+        job_id: Option<usize>,
+    ) -> Self {
         Self {
             name: name.to_string(),
             status: status.to_string(),
             purpose: purpose.to_string(),
+            workspace,
+            job_id,
         }
+    }
+}
+
+fn run_opencode_worker(
+    model: String,
+    prompt: String,
+    workspace: PathBuf,
+    tx: mpsc::Sender<BackendEvent>,
+) {
+    let mut child = match Command::new("opencode")
+        .args(["run", "-m", model.as_str(), prompt.as_str()])
+        .current_dir(workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = tx.send(BackendEvent::Error(format!(
+                "failed to start opencode: {err}"
+            )));
+            let _ = tx.send(BackendEvent::Done(false));
+            return;
+        }
+    };
+
+    let _ = tx.send(BackendEvent::Started(child.id()));
+    stream_child(&mut child, tx);
+}
+
+fn run_shell_worker(command: String, workspace: PathBuf, tx: mpsc::Sender<BackendEvent>) {
+    let mut child = match Command::new("sh")
+        .args(["-lc", command.as_str()])
+        .current_dir(workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = tx.send(BackendEvent::Error(format!(
+                "failed to start shell task: {err}"
+            )));
+            let _ = tx.send(BackendEvent::Done(false));
+            return;
+        }
+    };
+
+    let _ = tx.send(BackendEvent::Started(child.id()));
+    stream_child(&mut child, tx);
+}
+
+fn stream_child(child: &mut std::process::Child, tx: mpsc::Sender<BackendEvent>) {
+    if let Some(stdout) = child.stdout.take() {
+        let tx = tx.clone();
+        thread::spawn(move || stream_reader(stdout, StreamKind::Stdout, tx));
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        let tx = tx.clone();
+        thread::spawn(move || stream_reader(stderr, StreamKind::Stderr, tx));
+    }
+
+    let success = match child.wait() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            let _ = tx.send(BackendEvent::Error(format!(
+                "process exited with status {status}"
+            )));
+            false
+        }
+        Err(err) => {
+            let _ = tx.send(BackendEvent::Error(format!(
+                "failed waiting for process: {err}"
+            )));
+            false
+        }
+    };
+
+    let _ = tx.send(BackendEvent::Done(success));
+}
+
+fn create_worktree(workspace: &PathBuf, branch: &str) -> Result<(), String> {
+    if workspace.exists() {
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .args(["worktree", "add", "-b", branch])
+        .arg(workspace)
+        .output()
+        .map_err(|err| err.to_string())?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+fn run_git_capture(workspace: &PathBuf, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .output();
+    match output {
+        Ok(output) => clean_command_output(&format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(err) => format!("git failed: {err}"),
     }
 }
 
@@ -671,6 +1275,16 @@ where
             break;
         }
     }
+}
+
+fn truncate_chars(input: &str, max: usize) -> String {
+    if input.chars().count() <= max {
+        return input.to_string();
+    }
+
+    let mut truncated = input.chars().take(max).collect::<String>();
+    truncated.push_str("\n... truncated ...");
+    truncated
 }
 
 fn panel(title: &'static str) -> Block<'static> {
