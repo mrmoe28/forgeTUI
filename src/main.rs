@@ -84,7 +84,7 @@ impl Default for App {
             next_job_id: 1,
             selected_task: 0,
             selected_agent: 0,
-            show_sidebar: true,
+            show_sidebar: false,
             auto_test: true,
             tasks: vec![
                 Task::new("Build TUI shell", "ready", "cargo run"),

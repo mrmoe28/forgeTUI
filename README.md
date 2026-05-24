@@ -44,7 +44,7 @@ Prototype controls:
 - `/help`: show available commands
 - `/agent <task>` or `Ctrl-A`: spawn a real opencode subagent in an isolated Git worktree
 - `/run` or `Ctrl-R`: run the selected task
-- `/sidebar` or `Ctrl-B`: show or hide the side panels
+- `/sidebar` or `Ctrl-B`: show or hide the side panels, hidden by default
 - `/model [provider/model]`: show or switch the active model
 - `/models`: list known local models
 - `/cancel` or `Ctrl-X`: cancel the latest running job
