@@ -1,6 +1,8 @@
 use std::{
-    io::{self, IsTerminal, Stdout},
-    process::Command,
+    io::{self, BufRead, BufReader, IsTerminal, Stdout},
+    process::{Command, Stdio},
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
     time::Duration,
 };
 
@@ -48,6 +50,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 struct App {
     input: String,
     model: String,
+    opencode_rx: Option<Receiver<BackendEvent>>,
     selected_task: usize,
     selected_agent: usize,
     show_sidebar: bool,
@@ -62,6 +65,7 @@ impl Default for App {
         Self {
             input: String::new(),
             model: "ollama/glm-4.7:cloud".to_string(),
+            opencode_rx: None,
             selected_task: 0,
             selected_agent: 0,
             show_sidebar: true,
@@ -87,6 +91,7 @@ impl Default for App {
 impl App {
     fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         loop {
+            self.drain_backend_events();
             terminal.draw(|frame| self.render(frame))?;
 
             if event::poll(Duration::from_millis(200))? {
@@ -189,44 +194,117 @@ impl App {
     }
 
     fn run_opencode(&mut self, prompt: &str) {
+        if self.opencode_rx.is_some() {
+            self.transcript
+                .push(Message::system("opencode is already running"));
+            return;
+        }
+
         self.status = format!("running {}", self.model);
         self.transcript.push(Message::system(format!(
             "Running `opencode run -m {} ...`",
             self.model
         )));
 
-        let output = Command::new("opencode")
-            .args(["run", "-m", self.model.as_str(), prompt])
-            .output();
+        let (tx, rx) = mpsc::channel();
+        let model = self.model.clone();
+        let prompt = prompt.to_string();
 
-        match output {
-            Ok(output) => {
-                let stdout = clean_command_output(&String::from_utf8_lossy(&output.stdout));
-                let stderr = clean_command_output(&String::from_utf8_lossy(&output.stderr));
-
-                if !stdout.trim().is_empty() {
-                    self.transcript.push(Message::assistant(stdout.trim()));
+        thread::spawn(move || {
+            let mut child = match Command::new("opencode")
+                .args(["run", "-m", model.as_str(), prompt.as_str()])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(err) => {
+                    let _ = tx.send(BackendEvent::Error(format!(
+                        "failed to start opencode: {err}"
+                    )));
+                    let _ = tx.send(BackendEvent::Done);
+                    return;
                 }
+            };
 
-                if !stderr.trim().is_empty() {
-                    self.transcript
-                        .push(Message::system(format!("stderr:\n{}", stderr.trim())));
+            if let Some(stdout) = child.stdout.take() {
+                let tx = tx.clone();
+                thread::spawn(move || stream_reader(stdout, StreamKind::Stdout, tx));
+            }
+
+            if let Some(stderr) = child.stderr.take() {
+                let tx = tx.clone();
+                thread::spawn(move || stream_reader(stderr, StreamKind::Stderr, tx));
+            }
+
+            match child.wait() {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    let _ = tx.send(BackendEvent::Error(format!(
+                        "opencode exited with status {status}"
+                    )));
                 }
-
-                if !output.status.success() {
-                    self.transcript.push(Message::system(format!(
-                        "opencode exited with status {}",
-                        output.status
+                Err(err) => {
+                    let _ = tx.send(BackendEvent::Error(format!(
+                        "failed waiting for opencode: {err}"
                     )));
                 }
             }
-            Err(err) => {
-                self.transcript
-                    .push(Message::system(format!("failed to start opencode: {err}")));
+
+            let _ = tx.send(BackendEvent::Done);
+        });
+
+        self.opencode_rx = Some(rx);
+    }
+
+    fn drain_backend_events(&mut self) {
+        let Some(rx) = self.opencode_rx.take() else {
+            return;
+        };
+
+        let mut still_running = true;
+
+        loop {
+            match rx.try_recv() {
+                Ok(BackendEvent::Stdout(line)) => self.push_streamed_assistant_line(line),
+                Ok(BackendEvent::Stderr(line)) => {
+                    self.transcript
+                        .push(Message::system(format!("opencode: {line}")));
+                }
+                Ok(BackendEvent::Error(message)) => {
+                    self.transcript.push(Message::system(message));
+                }
+                Ok(BackendEvent::Done) => {
+                    self.status = "ready".to_string();
+                    still_running = false;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.status = "ready".to_string();
+                    still_running = false;
+                    break;
+                }
             }
         }
 
-        self.status = "ready".to_string();
+        if still_running {
+            self.opencode_rx = Some(rx);
+        }
+    }
+
+    fn push_streamed_assistant_line(&mut self, line: String) {
+        if let Some(Message {
+            role: Role::Assistant,
+            body,
+        }) = self.transcript.last_mut()
+        {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&line);
+        } else {
+            self.transcript.push(Message::assistant(line));
+        }
     }
 
     fn spawn_placeholder_agent(&mut self) {
@@ -488,6 +566,18 @@ enum Role {
     Assistant,
 }
 
+enum BackendEvent {
+    Stdout(String),
+    Stderr(String),
+    Error(String),
+    Done,
+}
+
+enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
 struct Task {
     name: String,
     status: String,
@@ -554,6 +644,33 @@ fn clean_command_output(input: &str) -> String {
         .filter(|line| !line.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn stream_reader<R>(reader: R, kind: StreamKind, tx: mpsc::Sender<BackendEvent>)
+where
+    R: io::Read,
+{
+    let reader = BufReader::new(reader);
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let line = clean_command_output(&line);
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let event = match kind {
+            StreamKind::Stdout => BackendEvent::Stdout(line),
+            StreamKind::Stderr => BackendEvent::Stderr(line),
+        };
+
+        if tx.send(event).is_err() {
+            break;
+        }
+    }
 }
 
 fn panel(title: &'static str) -> Block<'static> {

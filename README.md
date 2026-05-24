@@ -49,6 +49,8 @@ Prototype controls:
 - `Tab` / `Shift-Tab`: move agent selection
 - `Esc` or `Ctrl-C`: quit
 
+Normal prompts run in the background and stream command output into the conversation.
+
 ## Safety Model
 
 Subagents should work in isolated branches, worktrees, temp folders, or containers.
