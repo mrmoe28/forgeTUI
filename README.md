@@ -34,11 +34,13 @@ cargo run
 
 Prototype controls:
 
-- `Tab`: move focus
-- `Up` / `Down`: move selection in task and agent panels
-- `r`: mark the selected task as started
-- `a`: spawn a placeholder subagent
-- `q` or `Ctrl-C`: quit
+- type a request and press `Enter`: add it to the conversation
+- `/help`: show available commands
+- `/agent` or `Ctrl-A`: spawn a placeholder subagent
+- `/run` or `Ctrl-R`: mark the selected task as started
+- `Up` / `Down`: move task selection
+- `Tab` / `Shift-Tab`: move agent selection
+- `Esc` or `Ctrl-C`: quit
 
 ## Safety Model
 

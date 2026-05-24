@@ -11,10 +11,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
 
@@ -44,47 +44,20 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    Workspace,
-    Tasks,
-    Agents,
-    Output,
-}
-
-impl Focus {
-    fn next(self) -> Self {
-        match self {
-            Self::Workspace => Self::Tasks,
-            Self::Tasks => Self::Agents,
-            Self::Agents => Self::Output,
-            Self::Output => Self::Workspace,
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Workspace => "Workspace",
-            Self::Tasks => "Tasks",
-            Self::Agents => "Agents",
-            Self::Output => "Output",
-        }
-    }
-}
-
 struct App {
-    focus: Focus,
+    input: String,
     selected_task: usize,
     selected_agent: usize,
     tasks: Vec<Task>,
     agents: Vec<Agent>,
-    output: Vec<String>,
+    transcript: Vec<Message>,
+    status: String,
 }
 
 impl Default for App {
     fn default() -> Self {
         Self {
-            focus: Focus::Workspace,
+            input: String::new(),
             selected_task: 0,
             selected_agent: 0,
             tasks: vec![
@@ -97,10 +70,11 @@ impl Default for App {
                 Agent::new("worker-1", "idle", "Implement scoped code changes"),
                 Agent::new("reviewer", "idle", "Review diffs before merge"),
             ],
-            output: vec![
-                "ForgeTUI initialized.".to_string(),
-                "Press Tab to move focus, a to spawn a placeholder agent, q to quit.".to_string(),
+            transcript: vec![
+                Message::system("ForgeTUI started in agent workspace mode."),
+                Message::assistant("Type a task and press Enter. Use /agent to add a placeholder subagent or /run to start the selected task."),
             ],
+            status: "ready".to_string(),
         }
     }
 }
@@ -130,60 +104,102 @@ impl App {
                 ..
             }
             | KeyEvent {
-                code: KeyCode::Char('q'),
-                ..
+                code: KeyCode::Esc, ..
             } => return true,
             KeyEvent {
-                code: KeyCode::Tab, ..
-            } => self.focus = self.focus.next(),
-            KeyEvent {
-                code: KeyCode::Down,
+                code: KeyCode::Enter,
                 ..
-            } => self.move_selection(1),
+            } => self.submit_input(),
             KeyEvent {
-                code: KeyCode::Up, ..
-            } => self.move_selection(-1),
+                code: KeyCode::Char('\n' | '\r'),
+                ..
+            } => self.submit_input(),
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => {
+                self.input.pop();
+            }
             KeyEvent {
                 code: KeyCode::Char('a'),
+                modifiers: KeyModifiers::CONTROL,
                 ..
             } => self.spawn_placeholder_agent(),
             KeyEvent {
                 code: KeyCode::Char('r'),
+                modifiers: KeyModifiers::CONTROL,
                 ..
             } => self.run_selected_task(),
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => self.selected_task = bounded_index(self.selected_task, self.tasks.len(), 1),
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => self.selected_task = bounded_index(self.selected_task, self.tasks.len(), -1),
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            } => self.selected_agent = bounded_index(self.selected_agent, self.agents.len(), 1),
+            KeyEvent {
+                code: KeyCode::BackTab,
+                ..
+            } => self.selected_agent = bounded_index(self.selected_agent, self.agents.len(), -1),
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                ..
+            } => self.input.push(ch),
             _ => {}
         }
 
         false
     }
 
-    fn move_selection(&mut self, delta: isize) {
-        match self.focus {
-            Focus::Tasks => {
-                self.selected_task = bounded_index(self.selected_task, self.tasks.len(), delta);
+    fn submit_input(&mut self) {
+        let submitted = self.input.trim().to_string();
+        self.input.clear();
+
+        if submitted.is_empty() {
+            return;
+        }
+
+        self.transcript.push(Message::user(&submitted));
+
+        match submitted.as_str() {
+            "/agent" => self.spawn_placeholder_agent(),
+            "/run" => self.run_selected_task(),
+            "/help" => self.transcript.push(Message::assistant(
+                "Commands: /agent spawns a placeholder agent, /run starts the selected task, Ctrl-A and Ctrl-R do the same directly.",
+            )),
+            _ => {
+                self.status = "drafting".to_string();
+                self.transcript.push(Message::assistant(format!(
+                    "Queued request for the selected agent. Real model execution is the next integration step: `{submitted}`"
+                )));
+                self.status = "ready".to_string();
             }
-            Focus::Agents => {
-                self.selected_agent = bounded_index(self.selected_agent, self.agents.len(), delta);
-            }
-            _ => {}
         }
     }
 
     fn spawn_placeholder_agent(&mut self) {
         let name = format!("agent-{}", self.agents.len() + 1);
         self.agents
-            .push(Agent::new(&name, "spawned", "Awaiting task assignment"));
+            .push(Agent::new(&name, "spawned", "Awaiting scoped coding task"));
         self.selected_agent = self.agents.len() - 1;
-        self.focus = Focus::Agents;
-        self.output
-            .push(format!("Spawned placeholder subagent `{name}`."));
+        self.status = format!("spawned {name}");
+        self.transcript.push(Message::system(format!(
+            "Spawned placeholder subagent `{name}`."
+        )));
     }
 
     fn run_selected_task(&mut self) {
         if let Some(task) = self.tasks.get_mut(self.selected_task) {
             task.status = "started".to_string();
-            self.output
-                .push(format!("Task `{}` would run: {}", task.name, task.command));
+            self.status = format!("started {}", task.name);
+            self.transcript.push(Message::system(format!(
+                "Task `{}` would run: {}",
+                task.name, task.command
+            )));
         }
     }
 
@@ -191,68 +207,91 @@ impl App {
         let root = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
+                Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(3),
+                Constraint::Length(1),
             ])
             .split(frame.area());
 
         self.render_header(frame, root[0]);
-        self.render_body(frame, root[1]);
-        self.render_footer(frame, root[2]);
+        self.render_workspace(frame, root[1]);
+        self.render_composer(frame, root[2]);
+        self.render_keys(frame, root[3]);
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let title = Line::from(vec![
+        let header = Line::from(vec![
             Span::styled(
                 "ForgeTUI",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  unified coding workspace"),
+            Span::raw("  "),
+            Span::styled("agent workspace", Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::styled(&self.status, Style::default().fg(Color::Green)),
         ]);
-        frame.render_widget(
-            panel("Status").title_bottom(Line::from(self.focus.title())),
-            area,
-        );
-        frame.render_widget(Paragraph::new(title), inner(area));
-    }
-
-    fn render_body(&self, frame: &mut Frame, area: Rect) {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(28),
-                Constraint::Percentage(34),
-                Constraint::Percentage(38),
-            ])
-            .split(area);
-
-        self.render_workspace(frame, columns[0]);
-
-        let middle = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(columns[1]);
-        self.render_tasks(frame, middle[0]);
-        self.render_agents(frame, middle[1]);
-
-        self.render_output(frame, columns[2]);
+        frame.render_widget(Paragraph::new(header), area);
     }
 
     fn render_workspace(&self, frame: &mut Frame, area: Rect) {
-        let lines = vec![
-            Line::from("Project: forge-tui"),
-            Line::from("Binary: forge"),
-            Line::from("Mode: local orchestration"),
-            Line::from("Isolation: planned worktrees"),
-            Line::from("Diff review: planned"),
-        ];
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(area);
+
+        self.render_transcript(frame, columns[0]);
+        self.render_sidebar(frame, columns[1]);
+    }
+
+    fn render_transcript(&self, frame: &mut Frame, area: Rect) {
+        let lines = self
+            .transcript
+            .iter()
+            .flat_map(Message::render)
+            .collect::<Vec<_>>();
+        let visible = lines
+            .into_iter()
+            .rev()
+            .take(area.height.saturating_sub(2) as usize)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+
         frame.render_widget(
-            Paragraph::new(lines).block(focused_panel("Workspace", self.focus == Focus::Workspace)),
+            Paragraph::new(visible)
+                .block(panel("conversation"))
+                .wrap(Wrap { trim: false }),
             area,
         );
+    }
+
+    fn render_sidebar(&self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(6),
+                Constraint::Length(7),
+                Constraint::Min(0),
+            ])
+            .split(area);
+
+        self.render_project(frame, rows[0]);
+        self.render_tasks(frame, rows[1]);
+        self.render_agents(frame, rows[2]);
+    }
+
+    fn render_project(&self, frame: &mut Frame, area: Rect) {
+        let lines = vec![
+            Line::from("project  forge-tui"),
+            Line::from("binary   forge"),
+            Line::from("mode     local"),
+            Line::from("review   planned"),
+        ];
+        frame.render_widget(Paragraph::new(lines).block(panel("workspace")), area);
     }
 
     fn render_tasks(&self, frame: &mut Frame, area: Rect) {
@@ -265,15 +304,12 @@ impl App {
             ListItem::new(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(&task.name, Style::default().fg(Color::White)),
-                Span::raw("  "),
+                Span::raw(" "),
                 Span::styled(&task.status, Style::default().fg(Color::Yellow)),
             ]))
         });
 
-        frame.render_widget(
-            List::new(items).block(focused_panel("Tasks", self.focus == Focus::Tasks)),
-            area,
-        );
+        frame.render_widget(List::new(items).block(panel("tasks")), area);
     }
 
     fn render_agents(&self, frame: &mut Frame, area: Rect) {
@@ -287,7 +323,7 @@ impl App {
                 Line::from(vec![
                     Span::raw(marker),
                     Span::styled(&agent.name, Style::default().fg(Color::White)),
-                    Span::raw("  "),
+                    Span::raw(" "),
                     Span::styled(&agent.status, Style::default().fg(Color::Green)),
                 ]),
                 Line::from(vec![
@@ -297,34 +333,94 @@ impl App {
             ])
         });
 
+        frame.render_widget(List::new(items).block(panel("agents")), area);
+    }
+
+    fn render_composer(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+        let prompt = if self.input.is_empty() {
+            "Ask ForgeTUI to change code, run a task, or spawn an agent..."
+        } else {
+            self.input.as_str()
+        };
+        let style = if self.input.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
         frame.render_widget(
-            List::new(items).block(focused_panel("Agents", self.focus == Focus::Agents)),
+            Paragraph::new(Line::from(vec![
+                Span::styled("> ", Style::default().fg(Color::Cyan)),
+                Span::styled(prompt, style),
+            ]))
+            .block(panel("prompt"))
+            .wrap(Wrap { trim: false }),
             area,
         );
+
+        let cursor_x = area
+            .x
+            .saturating_add(3)
+            .saturating_add(self.input.len().min(area.width.saturating_sub(5) as usize) as u16);
+        frame.set_cursor_position(Position::new(cursor_x, area.y.saturating_add(1)));
     }
 
-    fn render_output(&self, frame: &mut Frame, area: Rect) {
-        let text = self
-            .output
-            .iter()
-            .rev()
-            .take(area.height.saturating_sub(2) as usize)
-            .rev()
-            .map(|line| Line::from(line.as_str()))
-            .collect::<Vec<_>>();
+    fn render_keys(&self, frame: &mut Frame, area: Rect) {
+        let help = "Enter send | /agent spawn | /run task | Up/Down task | Tab agent | Esc quit";
+        frame.render_widget(Paragraph::new(help), area);
+    }
+}
 
-        frame.render_widget(
-            Paragraph::new(text)
-                .block(focused_panel("Output", self.focus == Focus::Output))
-                .wrap(Wrap { trim: true }),
-            area,
-        );
+struct Message {
+    role: Role,
+    body: String,
+}
+
+impl Message {
+    fn system(body: impl Into<String>) -> Self {
+        Self {
+            role: Role::System,
+            body: body.into(),
+        }
     }
 
-    fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let help = "Tab focus | Up/Down select | r run task | a spawn agent | q quit";
-        frame.render_widget(Paragraph::new(help).block(panel("Keys")), area);
+    fn user(body: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            body: body.into(),
+        }
     }
+
+    fn assistant(body: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            body: body.into(),
+        }
+    }
+
+    fn render(&self) -> Vec<Line<'static>> {
+        let (label, color) = match self.role {
+            Role::System => ("system", Color::DarkGray),
+            Role::User => ("you", Color::Cyan),
+            Role::Assistant => ("forge", Color::Green),
+        };
+
+        vec![
+            Line::from(vec![Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(self.body.clone()),
+            Line::from(""),
+        ]
+    }
+}
+
+enum Role {
+    System,
+    User,
+    Assistant,
 }
 
 struct Task {
@@ -368,24 +464,9 @@ fn bounded_index(current: usize, len: usize, delta: isize) -> usize {
     (current as isize + delta).clamp(0, max) as usize
 }
 
-fn focused_panel(title: &'static str, focused: bool) -> Block<'static> {
-    let style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    panel(title).border_style(style)
-}
-
 fn panel(title: &'static str) -> Block<'static> {
-    Block::default().title(title).borders(Borders::ALL)
-}
-
-fn inner(area: Rect) -> Rect {
-    Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    }
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
 }
