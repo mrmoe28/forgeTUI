@@ -1,0 +1,19 @@
+# Build outputs
+target/
+dist/
+build/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Editor state
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
