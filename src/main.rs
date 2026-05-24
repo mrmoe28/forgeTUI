@@ -1,5 +1,6 @@
 use std::{
     io::{self, IsTerminal, Stdout},
+    process::Command,
     time::Duration,
 };
 
@@ -46,6 +47,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 
 struct App {
     input: String,
+    model: String,
     selected_task: usize,
     selected_agent: usize,
     show_sidebar: bool,
@@ -59,6 +61,7 @@ impl Default for App {
     fn default() -> Self {
         Self {
             input: String::new(),
+            model: "ollama/glm-4.7:cloud".to_string(),
             selected_task: 0,
             selected_agent: 0,
             show_sidebar: true,
@@ -74,7 +77,7 @@ impl Default for App {
             ],
             transcript: vec![
                 Message::system("ForgeTUI started in agent workspace mode."),
-                Message::assistant("Type a task and press Enter. Use /agent to add a placeholder subagent or /run to start the selected task."),
+                Message::assistant("Type a request and press Enter to run opencode with ollama/glm-4.7:cloud. Use /agent, /run, /sidebar, or /help for local commands."),
             ],
             status: "ready".to_string(),
         }
@@ -177,16 +180,53 @@ impl App {
             "/run" => self.run_selected_task(),
             "/sidebar" => self.toggle_sidebar(),
             "/help" => self.transcript.push(Message::assistant(
-                "Commands: /agent spawns a placeholder agent, /run starts the selected task, /sidebar toggles the side panels.",
+                "Commands: /agent spawns a placeholder agent, /run starts the selected task, /sidebar toggles the side panels. Normal prompts run opencode with the configured model.",
             )),
             _ => {
-                self.status = "drafting".to_string();
-                self.transcript.push(Message::assistant(format!(
-                    "Queued request for the selected agent. Real model execution is the next integration step: `{submitted}`"
-                )));
-                self.status = "ready".to_string();
+                self.run_opencode(&submitted);
             }
         }
+    }
+
+    fn run_opencode(&mut self, prompt: &str) {
+        self.status = format!("running {}", self.model);
+        self.transcript.push(Message::system(format!(
+            "Running `opencode run -m {} ...`",
+            self.model
+        )));
+
+        let output = Command::new("opencode")
+            .args(["run", "-m", self.model.as_str(), prompt])
+            .output();
+
+        match output {
+            Ok(output) => {
+                let stdout = clean_command_output(&String::from_utf8_lossy(&output.stdout));
+                let stderr = clean_command_output(&String::from_utf8_lossy(&output.stderr));
+
+                if !stdout.trim().is_empty() {
+                    self.transcript.push(Message::assistant(stdout.trim()));
+                }
+
+                if !stderr.trim().is_empty() {
+                    self.transcript
+                        .push(Message::system(format!("stderr:\n{}", stderr.trim())));
+                }
+
+                if !output.status.success() {
+                    self.transcript.push(Message::system(format!(
+                        "opencode exited with status {}",
+                        output.status
+                    )));
+                }
+            }
+            Err(err) => {
+                self.transcript
+                    .push(Message::system(format!("failed to start opencode: {err}")));
+            }
+        }
+
+        self.status = "ready".to_string();
     }
 
     fn spawn_placeholder_agent(&mut self) {
@@ -313,7 +353,7 @@ impl App {
             Line::from("project  forge-tui"),
             Line::from("binary   forge"),
             Line::from("mode     local"),
-            Line::from("review   planned"),
+            Line::from(format!("model   {}", self.model)),
         ];
         frame.render_widget(Paragraph::new(lines).block(panel("workspace")), area);
     }
@@ -487,6 +527,33 @@ fn bounded_index(current: usize, len: usize, delta: isize) -> usize {
 
     let max = len as isize - 1;
     (current as isize + delta).clamp(0, max) as usize
+}
+
+fn clean_command_output(input: &str) -> String {
+    let mut cleaned = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        cleaned.push(ch);
+    }
+
+    cleaned
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn panel(title: &'static str) -> Block<'static> {

@@ -32,9 +32,15 @@ Run locally with:
 cargo run
 ```
 
+Default model backend:
+
+```text
+opencode run -m ollama/glm-4.7:cloud
+```
+
 Prototype controls:
 
-- type a request and press `Enter`: add it to the conversation
+- type a request and press `Enter`: run it through `opencode`
 - `/help`: show available commands
 - `/agent` or `Ctrl-A`: spawn a placeholder subagent
 - `/run` or `Ctrl-R`: mark the selected task as started
