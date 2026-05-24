@@ -38,6 +38,19 @@ Default model backend:
 opencode run -m ollama/glm-4.7:cloud
 ```
 
+Configured Ollama cloud models:
+
+- `ollama/glm-4.7:cloud`
+- `ollama/glm-4.6:cloud`
+- `ollama/qwen3-coder:480b-cloud`
+- `ollama/gpt-oss:120b-cloud`
+- `ollama/minimax-m2:cloud`
+- `ollama/minimax-m2.1:cloud`
+- `ollama/kimi-k2.6:cloud`
+- `ollama/deepseek-v4-flash:cloud`
+
+ForgeTUI uses opencode for configured models. If an `ollama/...` model is not configured in opencode, ForgeTUI falls back to `ollama run`.
+
 Prototype controls:
 
 - type a request and press `Enter`: run it through `opencode`

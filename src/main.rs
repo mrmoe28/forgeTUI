@@ -76,6 +76,13 @@ impl Default for App {
             model: DEFAULT_MODEL.to_string(),
             models: vec![
                 "ollama/glm-4.7:cloud".to_string(),
+                "ollama/glm-4.6:cloud".to_string(),
+                "ollama/qwen3-coder:480b-cloud".to_string(),
+                "ollama/gpt-oss:120b-cloud".to_string(),
+                "ollama/minimax-m2:cloud".to_string(),
+                "ollama/minimax-m2.1:cloud".to_string(),
+                "ollama/kimi-k2.6:cloud".to_string(),
+                "ollama/deepseek-v4-flash:cloud".to_string(),
                 "ollama/qwen2.5-coder:32b".to_string(),
                 "ollama/qwen2.5-coder:7b".to_string(),
                 "ollama/hermes3:claude".to_string(),
@@ -271,8 +278,10 @@ impl App {
         let (tx, rx) = mpsc::channel();
 
         self.status = format!("running job #{id}");
+        let backend = BackendKind::for_model(&model);
         self.transcript.push(Message::system(format!(
-            "job #{id}: opencode run -m {model} in {}",
+            "job #{id}: {} {model} in {}",
+            backend.label(),
             workspace.display()
         )));
 
@@ -280,7 +289,7 @@ impl App {
             let model = model.clone();
             let prompt = prompt.clone();
             let workspace = workspace.clone();
-            move || run_opencode_worker(model, prompt, workspace, tx)
+            move || run_model_worker(model, prompt, workspace, tx)
         });
 
         self.jobs.push(BackendJob {
@@ -1014,6 +1023,28 @@ enum StreamKind {
     Stderr,
 }
 
+enum BackendKind {
+    Opencode,
+    Ollama,
+}
+
+impl BackendKind {
+    fn for_model(model: &str) -> Self {
+        if model.starts_with("ollama/") && !opencode_model_is_configured(model) {
+            Self::Ollama
+        } else {
+            Self::Opencode
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Opencode => "opencode run -m",
+            Self::Ollama => "ollama run",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct WorkspaceSnapshot {
     status: String,
@@ -1098,23 +1129,36 @@ impl Agent {
     }
 }
 
-fn run_opencode_worker(
+fn run_model_worker(
     model: String,
     prompt: String,
     workspace: PathBuf,
     tx: mpsc::Sender<BackendEvent>,
 ) {
-    let mut child = match Command::new("opencode")
-        .args(["run", "-m", model.as_str(), prompt.as_str()])
-        .current_dir(workspace)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+    let backend = BackendKind::for_model(&model);
+    let child = match backend {
+        BackendKind::Opencode => Command::new("opencode")
+            .args(["run", "-m", model.as_str(), prompt.as_str()])
+            .current_dir(workspace)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn(),
+        BackendKind::Ollama => {
+            let model = model.trim_start_matches("ollama/");
+            Command::new("ollama")
+                .args(["run", model, prompt.as_str()])
+                .current_dir(workspace)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        }
+    };
+
+    let mut child = match child {
         Ok(child) => child,
         Err(err) => {
             let _ = tx.send(BackendEvent::Error(format!(
-                "failed to start opencode: {err}"
+                "failed to start model backend: {err}"
             )));
             let _ = tx.send(BackendEvent::Done(false));
             return;
@@ -1212,6 +1256,28 @@ fn run_git_capture(workspace: &PathBuf, args: &[&str]) -> String {
         )),
         Err(err) => format!("git failed: {err}"),
     }
+}
+
+fn opencode_model_is_configured(model: &str) -> bool {
+    matches!(
+        model,
+        "ollama/deepseek-v4-flash:cloud"
+            | "ollama/glm-4.6:cloud"
+            | "ollama/glm-4.7:cloud"
+            | "ollama/gpt-oss:120b-cloud"
+            | "ollama/hermes3:8b"
+            | "ollama/hermes3:claude"
+            | "ollama/kimi-k2.6:cloud"
+            | "ollama/llama3.1:8b"
+            | "ollama/minimax-m2:cloud"
+            | "ollama/minimax-m2.1:cloud"
+            | "ollama/mistral-small:24b"
+            | "ollama/qwen2.5-coder:32b"
+            | "ollama/qwen2.5-coder:7b"
+            | "ollama/qwen2.5-coder:7b-claude"
+            | "ollama/qwen2.5:14b"
+            | "ollama/qwen3-coder:480b-cloud"
+    )
 }
 
 fn bounded_index(current: usize, len: usize, delta: isize) -> usize {
