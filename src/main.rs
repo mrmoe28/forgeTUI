@@ -48,6 +48,7 @@ struct App {
     input: String,
     selected_task: usize,
     selected_agent: usize,
+    show_sidebar: bool,
     tasks: Vec<Task>,
     agents: Vec<Agent>,
     transcript: Vec<Message>,
@@ -60,6 +61,7 @@ impl Default for App {
             input: String::new(),
             selected_task: 0,
             selected_agent: 0,
+            show_sidebar: true,
             tasks: vec![
                 Task::new("Build TUI shell", "ready", "cargo run"),
                 Task::new("Run tests", "queued", "cargo test"),
@@ -131,6 +133,11 @@ impl App {
                 ..
             } => self.run_selected_task(),
             KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.toggle_sidebar(),
+            KeyEvent {
                 code: KeyCode::Down,
                 ..
             } => self.selected_task = bounded_index(self.selected_task, self.tasks.len(), 1),
@@ -168,8 +175,9 @@ impl App {
         match submitted.as_str() {
             "/agent" => self.spawn_placeholder_agent(),
             "/run" => self.run_selected_task(),
+            "/sidebar" => self.toggle_sidebar(),
             "/help" => self.transcript.push(Message::assistant(
-                "Commands: /agent spawns a placeholder agent, /run starts the selected task, Ctrl-A and Ctrl-R do the same directly.",
+                "Commands: /agent spawns a placeholder agent, /run starts the selected task, /sidebar toggles the side panels.",
             )),
             _ => {
                 self.status = "drafting".to_string();
@@ -201,6 +209,15 @@ impl App {
                 task.name, task.command
             )));
         }
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.show_sidebar = !self.show_sidebar;
+        self.status = if self.show_sidebar {
+            "sidebar shown".to_string()
+        } else {
+            "sidebar hidden".to_string()
+        };
     }
 
     fn render(&self, frame: &mut Frame) {
@@ -237,6 +254,13 @@ impl App {
     }
 
     fn render_workspace(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        if !self.show_sidebar {
+            self.render_transcript(frame, area);
+            return;
+        }
+
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
@@ -367,7 +391,8 @@ impl App {
     }
 
     fn render_keys(&self, frame: &mut Frame, area: Rect) {
-        let help = "Enter send | /agent spawn | /run task | Up/Down task | Tab agent | Esc quit";
+        let help =
+            "Enter send | /agent spawn | /run task | /sidebar toggle | Ctrl-B sidebar | Esc quit";
         frame.render_widget(Paragraph::new(help), area);
     }
 }

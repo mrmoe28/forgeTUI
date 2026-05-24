@@ -38,6 +38,7 @@ Prototype controls:
 - `/help`: show available commands
 - `/agent` or `Ctrl-A`: spawn a placeholder subagent
 - `/run` or `Ctrl-R`: mark the selected task as started
+- `/sidebar` or `Ctrl-B`: show or hide the side panels
 - `Up` / `Down`: move task selection
 - `Tab` / `Shift-Tab`: move agent selection
 - `Esc` or `Ctrl-C`: quit
