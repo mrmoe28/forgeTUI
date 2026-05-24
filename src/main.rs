@@ -1,9 +1,9 @@
 use std::{
-    io::{self, Stdout},
+    io::{self, IsTerminal, Stdout},
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -26,6 +26,10 @@ fn main() -> Result<()> {
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("ForgeTUI must be run from an interactive terminal. Try: cd /home/mrmoe28/coding-tui && cargo run --bin forge");
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
