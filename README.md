@@ -100,12 +100,25 @@ Prototype controls:
 - `/test`: run `cargo check`
 - `/autotest`: toggle automatic `cargo check` after edited main-workspace runs
 - `/history`: show recent job/session history
+- `/memory`: show project and global memory
+- `/memory add <note>`: add project memory
+- `/memory global <note>`: add global memory
+- `/memory compact`: deduplicate and trim memory files
 - `Up` / `Down`: move task selection
 - `Tab` / `Shift-Tab`: move agent selection
 - `Esc` or `Ctrl-C`: quit
 
 Normal prompts run in the background and stream command output into the conversation.
 After a main-workspace opencode run, ForgeTUI snapshots Git status/diff before and after, tracks changed files through `git status --short`, and exposes the result through `/diff`, `/approve`, and `/reject`.
+
+## Memory
+
+ForgeTUI keeps durable Markdown memory in two places:
+
+- project memory: `.forge/memory/project.md`
+- global memory: `~/.local/share/forgeTUI/memory/global.md`
+
+Memory is injected into model prompts as context before normal opencode/Ollama runs and subagent runs. Project memory is repo-local and ignored by Git; global memory follows you across projects.
 
 ## Safety Model
 

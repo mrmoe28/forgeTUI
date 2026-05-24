@@ -162,6 +162,7 @@ main() {
   repo_dir="$(checkout_repo)"
   configure_opencode
   install_forge "$repo_dir"
+  mkdir -p "$HOME/.local/share/forgeTUI/memory"
   ensure_path_hint
 
   log "Setup complete"

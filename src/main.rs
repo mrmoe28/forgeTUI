@@ -1,4 +1,5 @@
 use std::{
+    fs,
     io::{self, BufRead, BufReader, IsTerminal, Stdout},
     path::PathBuf,
     process::{Command, Stdio},
@@ -24,6 +25,7 @@ use ratatui::{
 
 const DEFAULT_MODEL: &str = "ollama/glm-4.7:cloud";
 const DEFAULT_AGENT_ROOT: &str = ".forge/agents";
+const PROJECT_MEMORY_PATH: &str = ".forge/memory/project.md";
 
 fn main() -> Result<()> {
     let mut terminal = init_terminal()?;
@@ -66,6 +68,7 @@ struct App {
     transcript: Vec<Message>,
     history: Vec<SessionRecord>,
     pending_review: Option<ReviewState>,
+    memory: MemoryStore,
     status: String,
 }
 
@@ -114,6 +117,7 @@ impl Default for App {
             ],
             history: Vec::new(),
             pending_review: None,
+            memory: MemoryStore::load(),
             status: "ready".to_string(),
         }
     }
@@ -233,6 +237,7 @@ impl App {
             "/cancel" => self.cancel_latest_job(),
             "/diff" => self.show_pending_diff(),
             "/history" => self.show_history(),
+            "/memory" => self.handle_memory_command(rest),
             "/model" => self.set_or_show_model(rest),
             "/models" => self.show_models(),
             "/reject" => self.reject_review(),
@@ -247,7 +252,7 @@ impl App {
 
     fn show_help(&mut self) {
         self.transcript.push(Message::assistant(
-            "Commands: /model [provider/model], /models, /agent <task>, /cancel, /diff, /approve, /reject, /test, /autotest, /history, /sidebar. Normal prompts run opencode in the main workspace.",
+            "Commands: /model [provider/model], /models, /agent <task>, /cancel, /diff, /approve, /reject, /test, /autotest, /history, /memory, /sidebar. Normal prompts run opencode in the main workspace.",
         ));
     }
 
@@ -259,7 +264,8 @@ impl App {
         }
 
         let before = WorkspaceSnapshot::capture(PathBuf::from("."));
-        self.start_opencode_job("main", prompt, PathBuf::from("."), before, None);
+        let prompt = self.prompt_with_memory(prompt);
+        self.start_opencode_job("main", &prompt, PathBuf::from("."), before, None);
     }
 
     fn start_opencode_job(
@@ -484,7 +490,8 @@ impl App {
                 )));
 
                 let before = WorkspaceSnapshot::capture(workspace.clone());
-                self.start_opencode_job(&name, task, workspace, before, Some(agent_index));
+                let task = self.prompt_with_memory(task);
+                self.start_opencode_job(&name, &task, workspace, before, Some(agent_index));
                 let job_id = self.next_job_id.saturating_sub(1);
                 if let Some(agent) = self.agents.get_mut(agent_index) {
                     agent.job_id = Some(job_id);
@@ -653,6 +660,88 @@ impl App {
             .join("\n");
         self.transcript
             .push(Message::system(format!("history:\n{lines}")));
+    }
+
+    fn handle_memory_command(&mut self, rest: &str) {
+        let mut parts = rest.splitn(2, ' ');
+        let subcommand = parts.next().unwrap_or_default();
+        let value = parts.next().unwrap_or_default().trim();
+
+        match subcommand {
+            "" => self.show_memory(),
+            "add" | "project" => self.add_project_memory(value),
+            "global" => self.add_global_memory(value),
+            "compact" => self.compact_memory(),
+            "reload" => {
+                self.memory = MemoryStore::load();
+                self.transcript.push(Message::system("memory reloaded"));
+            }
+            _ => self.transcript.push(Message::system(
+                "memory commands: /memory, /memory add <note>, /memory global <note>, /memory compact, /memory reload",
+            )),
+        }
+    }
+
+    fn show_memory(&mut self) {
+        self.transcript.push(Message::system(format!(
+            "project memory: {}\n{}\n\nglobal memory: {}\n{}",
+            self.memory.project_path.display(),
+            empty_label(&self.memory.project),
+            self.memory.global_path.display(),
+            empty_label(&self.memory.global)
+        )));
+    }
+
+    fn add_project_memory(&mut self, note: &str) {
+        if note.is_empty() {
+            self.transcript
+                .push(Message::system("usage: /memory add <note>"));
+            return;
+        }
+
+        match self.memory.append_project(note) {
+            Ok(()) => self
+                .transcript
+                .push(Message::system("added project memory")),
+            Err(err) => self.transcript.push(Message::system(format!(
+                "failed to add project memory: {err}"
+            ))),
+        }
+    }
+
+    fn add_global_memory(&mut self, note: &str) {
+        if note.is_empty() {
+            self.transcript
+                .push(Message::system("usage: /memory global <note>"));
+            return;
+        }
+
+        match self.memory.append_global(note) {
+            Ok(()) => self.transcript.push(Message::system("added global memory")),
+            Err(err) => self.transcript.push(Message::system(format!(
+                "failed to add global memory: {err}"
+            ))),
+        }
+    }
+
+    fn compact_memory(&mut self) {
+        match self.memory.compact() {
+            Ok(()) => self.transcript.push(Message::system("memory compacted")),
+            Err(err) => self
+                .transcript
+                .push(Message::system(format!("failed to compact memory: {err}"))),
+        }
+    }
+
+    fn prompt_with_memory(&self, prompt: &str) -> String {
+        let context = self.memory.context();
+        if context.trim().is_empty() {
+            return prompt.to_string();
+        }
+
+        format!(
+            "Use this ForgeTUI memory as durable context. Do not quote it unless relevant.\n\n{context}\n\nUser request:\n{prompt}"
+        )
     }
 
     fn run_selected_task(&mut self) {
@@ -1087,6 +1176,64 @@ struct SessionRecord {
     changed: bool,
 }
 
+struct MemoryStore {
+    project_path: PathBuf,
+    global_path: PathBuf,
+    project: String,
+    global: String,
+}
+
+impl MemoryStore {
+    fn load() -> Self {
+        let project_path = PathBuf::from(PROJECT_MEMORY_PATH);
+        let global_path = global_memory_path();
+        let _ = ensure_memory_file(&project_path, "Project Memory");
+        let _ = ensure_memory_file(&global_path, "Global Memory");
+
+        Self {
+            project: fs::read_to_string(&project_path).unwrap_or_default(),
+            global: fs::read_to_string(&global_path).unwrap_or_default(),
+            project_path,
+            global_path,
+        }
+    }
+
+    fn context(&self) -> String {
+        let project = compact_memory_text(&self.project, 5000);
+        let global = compact_memory_text(&self.global, 5000);
+
+        if project.trim().is_empty() && global.trim().is_empty() {
+            return String::new();
+        }
+
+        format!(
+            "<project-memory>\n{}\n</project-memory>\n\n<global-memory>\n{}\n</global-memory>",
+            project.trim(),
+            global.trim()
+        )
+    }
+
+    fn append_project(&mut self, note: &str) -> io::Result<()> {
+        append_memory_note(&self.project_path, note)?;
+        self.project = fs::read_to_string(&self.project_path).unwrap_or_default();
+        Ok(())
+    }
+
+    fn append_global(&mut self, note: &str) -> io::Result<()> {
+        append_memory_note(&self.global_path, note)?;
+        self.global = fs::read_to_string(&self.global_path).unwrap_or_default();
+        Ok(())
+    }
+
+    fn compact(&mut self) -> io::Result<()> {
+        compact_memory_file(&self.project_path, "Project Memory")?;
+        compact_memory_file(&self.global_path, "Global Memory")?;
+        self.project = fs::read_to_string(&self.project_path).unwrap_or_default();
+        self.global = fs::read_to_string(&self.global_path).unwrap_or_default();
+        Ok(())
+    }
+}
+
 struct Task {
     name: String,
     status: String,
@@ -1255,6 +1402,95 @@ fn run_git_capture(workspace: &PathBuf, args: &[&str]) -> String {
             String::from_utf8_lossy(&output.stderr)
         )),
         Err(err) => format!("git failed: {err}"),
+    }
+}
+
+fn global_memory_path() -> PathBuf {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("forgeTUI/memory/global.md")
+}
+
+fn ensure_memory_file(path: &PathBuf, title: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if !path.exists() {
+        fs::write(
+            path,
+            format!(
+                "# {title}\n\nDurable notes for ForgeTUI. Keep entries short, factual, and reusable.\n\n"
+            ),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn append_memory_note(path: &PathBuf, note: &str) -> io::Result<()> {
+    ensure_memory_file(path, "Memory")?;
+    let mut existing = fs::read_to_string(path).unwrap_or_default();
+    if !existing.ends_with('\n') {
+        existing.push('\n');
+    }
+    existing.push_str(&format!("- {}\n", note.trim()));
+    fs::write(path, existing)
+}
+
+fn compact_memory_file(path: &PathBuf, title: &str) -> io::Result<()> {
+    ensure_memory_file(path, title)?;
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let mut seen = Vec::<String>::new();
+
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("Durable notes") {
+            continue;
+        }
+        if !seen.iter().any(|item| item == trimmed) {
+            seen.push(trimmed.to_string());
+        }
+    }
+
+    let mut compacted = format!(
+        "# {title}\n\nDurable notes for ForgeTUI. Keep entries short, factual, and reusable.\n\n"
+    );
+    for line in seen
+        .into_iter()
+        .rev()
+        .take(80)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        compacted.push_str(&line);
+        compacted.push('\n');
+    }
+    fs::write(path, compacted)
+}
+
+fn compact_memory_text(input: &str, max_chars: usize) -> String {
+    let filtered = input
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !trimmed.starts_with('#')
+                && !trimmed.starts_with("Durable notes")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    truncate_chars(&filtered, max_chars)
+}
+
+fn empty_label(input: &str) -> String {
+    if compact_memory_text(input, 10000).trim().is_empty() {
+        "(empty)".to_string()
+    } else {
+        input.trim().to_string()
     }
 }
 
